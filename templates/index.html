@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Docker Monitor Image</title>
+
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/favicon-dockermonitorimage.png') }}">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="container">
+
+  <header>
+    <h1 class="brand-title">
+      <img src="{{ url_for('static', filename='img/image-dockermonitorimage.png') }}" alt="Logo" class="brand-logo">
+      <span data-i18n="brand">Docker Monitor Image</span>
+    </h1>
+
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <button id="refreshNow" class="btn btn-primary btn-icon">
+          <span class="icon">↻</span>
+          <span data-i18n="refresh">Rafraîchir</span>
+        </button>
+
+        <button id="prune" class="btn">
+          🧹 <span data-i18n="prune">Nettoyer</span>
+          <span class="badge" id="unusedCount">—</span>
+        </button>
+      </div>
+
+      <div class="toolbar-right">
+        <button id="settingsBtn" class="btn btn-ghost btn-icon">
+          <span class="icon">⚙️</span>
+          <span data-i18n="settings">Réglages</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="panel">
+      <table class="table" role="grid">
+        <colgroup>
+          <col style="width: 13%">
+          <col style="width: 48%">
+          <col style="width: 10%">
+          <col style="width: 18%">
+          <col style="width: 13%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th scope="col" data-i18n="th_container">Conteneur</th>
+            <th scope="col" data-i18n="th_state">État &amp; Ressources</th>
+            <th scope="col" class="status" data-i18n="th_status">Statut</th>
+            <th scope="col" class="link" data-i18n="th_link">Lien</th>
+            <th scope="col" class="action" data-i18n="th_action">Action</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </main>
+
+  <div id="settingsModal" class="modal" aria-hidden="true">
+    <div class="box">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+        <h3 data-i18n="settings_title">Réglages</h3>
+        <button id="settingsClose" class="btn">✖</button>
+      </div>
+
+      <h4 style="margin:14px 0 6px 0;" data-i18n="language_label">Langue de l’interface</h4>
+      <div class="row">
+        <select id="langSelect" aria-label="Language">
+          <option value="fr">Français</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <input type="checkbox" id="useApiKey">
+        <label for="useApiKey" data-i18n="auth_label">Activer l'authentification par clé API</label>
+      </div>
+
+      <div class="row">
+        <input type="text" id="apiKeyInput" placeholder="Clé API" />
+        <button id="generateApiKey" class="btn" style="margin-left:6px;" data-i18n="generate">Générer</button>
+      </div>
+
+      <h4 style="margin:14px 0 6px 0;" data-i18n="cidr_title">IP autorisées (CIDR)</h4>
+      <div class="row" style="flex-direction:column;align-items:stretch;">
+        <textarea id="ipAllowInput" rows="6" placeholder="0.0.0.0/0&#10;192.168.1.0/24&#10;::/0" style="width:100%;background:#111522;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;"></textarea>
+        <small class="muted" data-i18n="cidr_hint">Une plage par ligne. Par défaut : 0.0.0.0/0 (tout le monde). IPv6 supporté (ex: ::/0).</small>
+      </div>
+
+      <div class="actions">
+        <button id="settingsSave" class="btn btn-primary" data-i18n="save">Enregistrer</button>
+      </div>
+
+      <p class="muted" style="margin-top:14px;font-size:13px;line-height:1.45">
+        <a href="https://github.com/vomfive/dockermonitorimage-ha" target="_blank" rel="noopener" style="color:var(--secondary);text-decoration:none;" data-i18n="ha_doc">
+          ↗ Intégration Home Assistant : documentation officielle
+        </a>
+      </p>
+
+      <p class="muted" style="margin-top:8px;font-size:12px;line-height:1.4" data-i18n="auth_hint">
+        Astuce : si l'auth est désactivée, aucune clé n'est requise. Les IP autorisées s'appliquent toujours.
+      </p>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <a id="appVersion" href="https://github.com/vomfive/Docker-Monitor-Image" target="_blank" rel="noopener">
+    v1.0.0
+  </a>
+</body>
+</html>
