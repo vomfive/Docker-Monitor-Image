@@ -15,8 +15,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const refreshNowBtn = document.getElementById('refreshNow');
 
   let authState = { auth_enabled: false, api_key: '', allowed_cidrs: [] };
+  let sessionActive = false; 
   let isRendering = false;
   const FAST_REFRESH_MS = 5000;
+
+
+  function isMaskedKey(s) {
+    return typeof s === 'string' && /^\*+$/.test(s.trim());
+  }
 
   const I18N = {
     fr: {
@@ -53,6 +59,8 @@ document.addEventListener('DOMContentLoaded', () => {
       NET: 'NET',
       state_running: 'running',
       state_loading: 'Chargement…',
+      settings_saved: 'Réglages enregistrés',
+      gen_failed: 'Erreur lors de la génération: ',
     },
     en: {
       brand: 'Docker Monitor Image',
@@ -88,6 +96,8 @@ document.addEventListener('DOMContentLoaded', () => {
       NET: 'NET',
       state_running: 'running',
       state_loading: 'Loading…',
+      settings_saved: 'Settings saved',
+      gen_failed: 'Generation failed: ',
     }
   };
   let LANG = localStorage.getItem('dm_lang') || (navigator.language || 'fr').slice(0,2);
@@ -116,15 +126,68 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   function keyParams(extra = {}) {
     const p = { ...extra };
-    if (authState.auth_enabled && authState.api_key) p.key = authState.api_key;
+    if (!sessionActive && authState.auth_enabled && authState.api_key && !isMaskedKey(authState.api_key)) {
+      p.key = authState.api_key;
+    }
     return p;
   }
+
+  async function fetchJSON(path, { method='GET', params=null, body=null, headers=null, useKeyFallback=true } = {}) {
+    const url = params ? buildUrl(path, params) : path;
+    const opts = {
+      method,
+      headers: { ...(headers || {}) },
+      credentials: 'include' 
+    };
+    if (body != null) {
+      opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+      if (!opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';
+    }
+
+    let res = await fetch(url, opts);
+    if (res.status === 401 && useKeyFallback && !sessionActive && authState.auth_enabled && authState.api_key && !isMaskedKey(authState.api_key)) {
+      const urlWithKey = buildUrl(path, keyParams(params || {}));
+      res = await fetch(urlWithKey, opts);
+    }
+    if (!res.ok) {
+      const errText = await res.text().catch(()=> '');
+      const err = new Error(errText || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json().catch(()=> ({}));
+  }
+
+  async function tryStartSessionWithApiKey() {
+    if (!authState.auth_enabled) return false;
+    const k = authState.api_key;
+    if (!k || isMaskedKey(k)) return false;
+    try {
+      const data = await fetchJSON('/auth/login', {
+        method: 'POST',
+        body: { api_key: k },
+        useKeyFallback: false
+      });
+      if (data && data.status === 'ok') {
+        sessionActive = true;
+        return true;
+      }
+    } catch {
+    }
+    return false;
+  }
+
   function formatBytes(b) {
     if (b == null) return '0 B';
     const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
     let i = 0, n = Number(b);
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return (Math.round(n * 10) / 10) + ' ' + u[i];
+  }
+  function clampPct(n) {
+    const x = isNaN(n) ? 0 : Number(n);
+    if (!isFinite(x)) return 0;
+    return Math.max(0, Math.min(100, x));
   }
   function fmtPct(n) {
     if (n == null || isNaN(n)) return '0%';
@@ -174,7 +237,6 @@ document.addEventListener('DOMContentLoaded', () => {
   let netPeakBps = 2 * 1024 * 1024;
   const cpuEma = new Map();
   const ramEma = new Map();
-
   function emaUpdate(map, name, value, alpha = 0.3) {
     if (typeof value !== 'number' || !isFinite(value)) return 0;
     const prev = map.get(name);
@@ -204,37 +266,28 @@ document.addEventListener('DOMContentLoaded', () => {
     return { rxps, txps, dt };
   }
 
+  // ---------- API wrappers ----------
   async function fetchSettings() {
-    const res = await fetch('/settings');
-    if (!res.ok) throw new Error('GET /settings failed');
-    const data = await res.json();
+    const data = await fetchJSON('/settings');
     authState = {
       auth_enabled: !!data.auth_enabled,
-      api_key: data.api_key || '',
+      api_key: isMaskedKey(data.api_key) ? '' : (data.api_key || ''),
       allowed_cidrs: Array.isArray(data.allowed_cidrs) ? data.allowed_cidrs : []
     };
     return authState;
   }
   async function saveSettings(payload) {
-    const res = await fetch('/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) throw new Error('POST /settings failed');
-    const data = await res.json();
+    const data = await fetchJSON('/settings', { method: 'POST', body: payload });
     authState = {
       auth_enabled: !!data.auth_enabled,
-      api_key: data.api_key || '',
+      api_key: isMaskedKey(data.api_key) ? '' : (data.api_key || ''),
       allowed_cidrs: Array.isArray(data.allowed_cidrs) ? data.allowed_cidrs : []
     };
     return data;
   }
   async function fetchUnusedImages() {
     try {
-      const res = await fetch(buildUrl('/images/unused', keyParams()));
-      if (!res.ok) throw new Error();
-      const data = await res.json();
+      const data = await fetchJSON('/images/unused', { params: sessionActive ? {} : keyParams() });
       if (unusedCountElem) unusedCountElem.textContent = (typeof data.count === 'number') ? data.count : '—';
     } catch {
       if (unusedCountElem) unusedCountElem.textContent = '—';
@@ -244,59 +297,49 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!confirm(t('prune') + ' ?')) return;
     if (pruneBtn) pruneBtn.disabled = true;
     try {
-      const res = await fetch(buildUrl('/images/prune', keyParams()), { method: 'POST' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        alert(t('clean_fail', { err: (data.error || res.status) }));
-      } else {
-        const reclaimed = (data.SpaceReclaimed != null ? data.SpaceReclaimed : 0);
-        alert(t('cleaned_ok', { bytes: reclaimed }));
-      }
+      const data = await fetchJSON('/images/prune', {
+        method: 'POST',
+        params: sessionActive ? {} : keyParams()
+      });
+      const reclaimed = (data.SpaceReclaimed != null ? data.SpaceReclaimed : 0);
+      alert(t('cleaned_ok', { bytes: reclaimed }));
       await fetchUnusedImages();
       await render(true, true);
+    } catch (e) {
+      alert(t('clean_fail', { err: e.message }));
     } finally {
       if (pruneBtn) pruneBtn.disabled = false;
     }
   }
-
   async function fetchStatus({ force=false, light=false } = {}) {
     const params = {};
     if (force) params.force = '1';
     if (light) params.light = '1';
-    const res = await fetch(buildUrl('/status', keyParams(params)));
-    if (!res.ok) throw new Error('GET /status failed');
-    return res.json();
+    const data = await fetchJSON('/status', { params: sessionActive ? params : keyParams(params) });
+    return data;
   }
   async function fetchStatusOne(name, force=false) {
-    const res = await fetch(buildUrl(`/status/${encodeURIComponent(name)}`, keyParams(force? {force:'1'}:{})));
-    if (!res.ok) throw new Error('GET /status/' + name + ' failed');
-    return res.json();
+    const params = force ? { force: '1' } : {};
+    const data = await fetchJSON(`/status/${encodeURIComponent(name)}`, { params: sessionActive ? params : keyParams(params) });
+    return data;
   }
   async function fetchMetricsOne(name){
     try{
-      const res = await fetch(buildUrl(`/metrics/${encodeURIComponent(name)}`, keyParams()));
-      if(!res.ok) return;
-      const data = await res.json();
+      const data = await fetchJSON(`/metrics/${encodeURIComponent(name)}`, { params: sessionActive ? {} : keyParams() });
       const tr = document.getElementById(`row-${name}`);
       if (!tr) return;
       const m = data.meta || {};
       renderResourcesCell(tr.children[1], m, name);
     }catch(e){ /* soft */ }
   }
-
   async function updateContainer(name, btn) {
     if (btn) { btn.disabled = true; btn.textContent = t('update_btn'); }
     try {
-      const res = await fetch(buildUrl('/update_container', keyParams()), {
+      const data = await fetchJSON('/update_container', {
         method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ name })
+        params: sessionActive ? {} : keyParams(),
+        body: { name }
       });
-      const data = await res.json().catch(()=> ({}));
-      if (!res.ok) {
-        const msg = data && (data.error || data.message) ? (data.error || data.message) : `HTTP ${res.status}`;
-        throw new Error(msg);
-      }
       if (data && (data.updated === false || /already up to date/i.test(String(data.message||'')))) {
         alert(t('up_to_date', { name }));
         await render(false);
@@ -313,11 +356,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function clampPct(n) {
-    const x = isNaN(n) ? 0 : Number(n);
-    if (!isFinite(x)) return 0;
-    return Math.max(0, Math.min(100, x));
-  }
   function renderResourcesLoading(td) {
     if (!td) return;
     td.innerHTML = '';
@@ -395,7 +433,6 @@ document.addEventListener('DOMContentLoaded', () => {
       if (e.isIntersecting) visibleNames.add(name); else visibleNames.delete(name);
     }
   }, { root: listRoot || null, threshold: 0.1 });
-
   function observeRow(tr) {
     try { rowObserver.observe(tr); } catch {}
   }
@@ -548,7 +585,10 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchSettings()
       .then(s => {
         if (useApiKeyCheckbox) useApiKeyCheckbox.checked = !!s.auth_enabled;
-        if (apiKeyInput) apiKeyInput.value = s.api_key || '';
+        if (apiKeyInput) {
+          apiKeyInput.value = '';
+          apiKeyInput.placeholder = '********';
+        }
         if (ipAllowInput) ipAllowInput.value = (Array.isArray(s.allowed_cidrs) ? s.allowed_cidrs : ['0.0.0.0/0']).join('\n');
         if (settingsModal){ settingsModal.style.display = 'block'; settingsModal.setAttribute('aria-hidden', 'false'); }
       })
@@ -562,13 +602,24 @@ document.addEventListener('DOMContentLoaded', () => {
   async function onSaveSettings() {
     try {
       const allowed = ipAllowInput ? ipAllowInput.value.split('\n').map(s => s.trim()).filter(Boolean) : [];
-      await saveSettings({
+      const payload = {
         auth_enabled: !!(useApiKeyCheckbox && useApiKeyCheckbox.checked),
-        api_key: apiKeyInput ? apiKeyInput.value.trim() : '',
         allowed_cidrs: allowed
-      });
-      alert(LANG === 'en' ? 'Settings saved' : 'Réglages enregistrés');
+      };
+      const maybeKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+      if (maybeKey && !isMaskedKey(maybeKey)) {
+        payload.api_key = maybeKey; 
+      }
+      await saveSettings(payload);
+      alert(t('settings_saved'));
       closeSettings();
+
+      
+      if (authState.auth_enabled) {
+        
+        await tryStartSessionWithApiKey();
+      }
+
       render(true);
     } catch (e) {
       alert((LANG === 'en' ? 'Error while saving: ' : 'Erreur lors de l’enregistrement: ') + e.message);
@@ -582,10 +633,14 @@ document.addEventListener('DOMContentLoaded', () => {
         generate_api_key: true,
         allowed_cidrs: allowed
       });
-      if (apiKeyInput) apiKeyInput.value = data.api_key || '';
+      if (apiKeyInput) {
+        apiKeyInput.value = data.api_key || ''; 
+      }
       if (useApiKeyCheckbox) useApiKeyCheckbox.checked = !!data.auth_enabled;
+
+      await tryStartSessionWithApiKey();
     } catch (e) {
-      alert((LANG === 'en' ? 'Generation failed: ' : 'Erreur lors de la génération: ') + e.message);
+      alert(t('gen_failed') + e.message);
     }
   }
 
@@ -629,10 +684,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+
   (async () => {
     applyStaticTranslations();
 
     try { await fetchSettings(); } catch {}
+
+    try { await tryStartSessionWithApiKey(); } catch {}
+
     fetchUnusedImages();
     setInterval(fetchUnusedImages, 30000);
 
