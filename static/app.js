@@ -15,9 +15,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const refreshNowBtn = document.getElementById('refreshNow');
 
   let authState = { auth_enabled: false, api_key: '', allowed_cidrs: [] };
-  let sessionActive = false; 
+  let sessionActive = false;
   let isRendering = false;
-  const FAST_REFRESH_MS = 5000;
+  let sseConnected = false;
+  const FALLBACK_REFRESH_MS = 10000;
+  const METRICS_REFRESH_MS = 8000;
 
 
   function isMaskedKey(s) {
@@ -27,40 +29,40 @@ document.addEventListener('DOMContentLoaded', () => {
   const I18N = {
     fr: {
       brand: 'Docker Monitor Image',
-      refresh: 'Rafraîchir',
+      refresh: 'Rafra\u00eechir',
       prune: 'Nettoyer',
-      settings: 'Réglages',
+      settings: 'R\u00e9glages',
       th_container: 'Conteneur',
-      th_state: 'État & Ressources',
+      th_state: '\u00c9tat & Ressources',
       th_status: 'Statut',
       th_link: 'Lien',
       th_action: 'Action',
-      settings_title: 'Réglages',
-      language_label: 'Langue de l’interface',
-      auth_label: "Activer l'authentification par clé API",
-      generate: 'Générer',
-      cidr_title: 'IP autorisées (CIDR)',
-      cidr_hint: 'Une plage par ligne. Par défaut : 0.0.0.0/0 (tout le monde). IPv6 supporté (ex: ::/0).',
+      settings_title: 'R\u00e9glages',
+      language_label: 'Langue de l\u2019interface',
+      auth_label: "Activer l'authentification par cl\u00e9 API",
+      generate: 'G\u00e9n\u00e9rer',
+      cidr_title: 'IP autoris\u00e9es (CIDR)',
+      cidr_hint: 'Une plage par ligne. Par d\u00e9faut : 0.0.0.0/0 (tout le monde). IPv6 support\u00e9 (ex: ::/0).',
       save: 'Enregistrer',
-      ha_doc: '↗ Intégration Home Assistant : documentation officielle',
-      auth_hint: "Astuce : si l'auth est désactivée, aucune clé n'est requise. Les IP autorisées s'appliquent toujours.",
-      loading: 'Chargement…',
-      refresh_ing: 'Rafraîchir…',
-      cleaned_ok: 'Nettoyage terminé. Espace récupéré: {bytes} octets.',
-      clean_fail: 'Échec du nettoyage: {err}',
-      update_btn: 'Mettre à jour',
-      updated_ok: '✅ {name} mis à jour',
-      up_to_date: '✅ {name} est déjà à jour',
-      update_fail: '❌ {name}: {err}',
-      refresh_fail: 'Échec du rafraîchissement: {err}',
-      pending: 'pending…',
+      ha_doc: '\u2197 Int\u00e9gration Home Assistant : documentation officielle',
+      auth_hint: "Astuce : si l'auth est d\u00e9sactiv\u00e9e, aucune cl\u00e9 n'est requise. Les IP autoris\u00e9es s'appliquent toujours.",
+      loading: 'Chargement\u2026',
+      refresh_ing: 'Rafra\u00eechir\u2026',
+      cleaned_ok: 'Nettoyage termin\u00e9. Espace r\u00e9cup\u00e9r\u00e9: {bytes} octets.',
+      clean_fail: '\u00c9chec du nettoyage: {err}',
+      update_btn: 'Mettre \u00e0 jour',
+      updated_ok: '\u2705 {name} mis \u00e0 jour',
+      up_to_date: '\u2705 {name} est d\u00e9j\u00e0 \u00e0 jour',
+      update_fail: '\u274c {name}: {err}',
+      refresh_fail: '\u00c9chec du rafra\u00eechissement: {err}',
+      pending: 'pending\u2026',
       CPU: 'CPU',
       RAM: 'RAM',
       NET: 'NET',
       state_running: 'running',
-      state_loading: 'Chargement…',
-      settings_saved: 'Réglages enregistrés',
-      gen_failed: 'Erreur lors de la génération: ',
+      state_loading: 'Chargement\u2026',
+      settings_saved: 'R\u00e9glages enregistr\u00e9s',
+      gen_failed: 'Erreur lors de la g\u00e9n\u00e9ration: ',
     },
     en: {
       brand: 'Docker Monitor Image',
@@ -79,23 +81,23 @@ document.addEventListener('DOMContentLoaded', () => {
       cidr_title: 'Allowed IPs (CIDR)',
       cidr_hint: 'One network per line. Default: 0.0.0.0/0 (everyone). IPv6 supported (e.g. ::/0).',
       save: 'Save',
-      ha_doc: '↗ Home Assistant Integration: official docs',
+      ha_doc: '\u2197 Home Assistant Integration: official docs',
       auth_hint: 'Tip: if auth is disabled, no key is required. Allowed IPs always apply.',
-      loading: 'Loading…',
-      refresh_ing: 'Refreshing…',
+      loading: 'Loading\u2026',
+      refresh_ing: 'Refreshing\u2026',
       cleaned_ok: 'Prune done. Space reclaimed: {bytes} bytes.',
       clean_fail: 'Prune failed: {err}',
       update_btn: 'Update',
-      updated_ok: '✅ {name} updated',
-      up_to_date: '✅ {name} is already up to date',
-      update_fail: '❌ {name}: {err}',
+      updated_ok: '\u2705 {name} updated',
+      up_to_date: '\u2705 {name} is already up to date',
+      update_fail: '\u274c {name}: {err}',
       refresh_fail: 'Refresh failed: {err}',
-      pending: 'pending…',
+      pending: 'pending\u2026',
       CPU: 'CPU',
       RAM: 'RAM',
       NET: 'NET',
       state_running: 'running',
-      state_loading: 'Loading…',
+      state_loading: 'Loading\u2026',
       settings_saved: 'Settings saved',
       gen_failed: 'Generation failed: ',
     }
@@ -114,7 +116,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const key = el.getAttribute('data-i18n');
       el.textContent = t(key);
     });
-    if (apiKeyInput) apiKeyInput.placeholder = (LANG === 'en' ? 'API key' : 'Clé API');
+    if (apiKeyInput) apiKeyInput.placeholder = (LANG === 'en' ? 'API key' : 'Cl\u00e9 API');
     document.title = t('brand');
     try { document.documentElement.setAttribute('lang', LANG); } catch {}
     if (langSelect) langSelect.value = LANG;
@@ -124,8 +126,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const q = new URLSearchParams(params || {});
     return path + (q.toString() ? ('?' + q.toString()) : '');
   }
-  function keyParams(extra = {}) {
-    const p = { ...extra };
+
+  // Auth via Authorization header (preferred over query param)
+  function authHeaders() {
+    const h = {};
+    if (!sessionActive && authState.auth_enabled && authState.api_key && !isMaskedKey(authState.api_key)) {
+      h['Authorization'] = 'Bearer ' + authState.api_key;
+    }
+    return h;
+  }
+
+  // Query param key — only used for SSE EventSource (no header support)
+  function sseKeyParams() {
+    const p = {};
     if (!sessionActive && authState.auth_enabled && authState.api_key && !isMaskedKey(authState.api_key)) {
       p.key = authState.api_key;
     }
@@ -136,8 +149,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const url = params ? buildUrl(path, params) : path;
     const opts = {
       method,
-      headers: { ...(headers || {}) },
-      credentials: 'include' 
+      headers: { ...(headers || {}), ...authHeaders() },
+      credentials: 'include'
     };
     if (body != null) {
       opts.body = typeof body === 'string' ? body : JSON.stringify(body);
@@ -146,7 +159,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let res = await fetch(url, opts);
     if (res.status === 401 && useKeyFallback && !sessionActive && authState.auth_enabled && authState.api_key && !isMaskedKey(authState.api_key)) {
-      const urlWithKey = buildUrl(path, keyParams(params || {}));
+      // Last resort: key in URL (for proxies that strip headers)
+      const urlWithKey = buildUrl(path, { ...(params || {}), key: authState.api_key });
       res = await fetch(urlWithKey, opts);
     }
     if (!res.ok) {
@@ -213,16 +227,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!repoPath.includes('/')) return `https://hub.docker.com/_/${repoPath}`;
     const first = repoPath.split('/')[0];
     if (!first.includes('.') && !first.includes(':')) return `https://hub.docker.com/r/${repoPath}`;
-    return `https://www.google.com/search?q=${encodeURIComponent(repoPath)}+docker`;
+    return null;
   }
   function repoLabelFromImage(imageRef) {
     if (!imageRef) return null;
     let ref = String(imageRef).trim();
     if (ref.startsWith('[') && ref.endsWith(']')) ref = ref.slice(1, -1);
     const idx = ref.lastIndexOf(':');
-    const tag = idx > -1 ? ref.slice(idx) : '';
+    const tagStr = idx > -1 ? ref.slice(idx) : '';
     let repoPath = idx > -1 ? ref.slice(0, idx) : ref;
-    return repoPath.replace(/^ghcr\.io\//, '').replace(/^lscr\.io\//, '').replace(/^registry-1\.docker\.io\//, '').replace(/^library\//, '') + tag;
+    return repoPath.replace(/^ghcr\.io\//, '').replace(/^lscr\.io\//, '').replace(/^registry-1\.docker\.io\//, '').replace(/^library\//, '') + tagStr;
   }
   function stateClass(s) {
     const v = String(s || '').toLowerCase();
@@ -266,6 +280,23 @@ document.addEventListener('DOMContentLoaded', () => {
     return { rxps, txps, dt };
   }
 
+  // ---------- Safe DOM helpers ----------
+  function setLinkCell(td, imageRef) {
+    td.innerHTML = '';
+    const link = repoLinkFromImage(imageRef);
+    const label = repoLabelFromImage(imageRef);
+    if (link) {
+      const a = document.createElement('a');
+      a.href = link;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = label || '';
+      td.appendChild(a);
+    } else {
+      td.textContent = label || '\u2014';
+    }
+  }
+
   // ---------- API wrappers ----------
   async function fetchSettings() {
     const data = await fetchJSON('/settings');
@@ -287,20 +318,17 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   async function fetchUnusedImages() {
     try {
-      const data = await fetchJSON('/images/unused', { params: sessionActive ? {} : keyParams() });
-      if (unusedCountElem) unusedCountElem.textContent = (typeof data.count === 'number') ? data.count : '—';
+      const data = await fetchJSON('/images/unused');
+      if (unusedCountElem) unusedCountElem.textContent = (typeof data.count === 'number') ? data.count : '\u2014';
     } catch {
-      if (unusedCountElem) unusedCountElem.textContent = '—';
+      if (unusedCountElem) unusedCountElem.textContent = '\u2014';
     }
   }
   async function pruneUnused() {
     if (!confirm(t('prune') + ' ?')) return;
     if (pruneBtn) pruneBtn.disabled = true;
     try {
-      const data = await fetchJSON('/images/prune', {
-        method: 'POST',
-        params: sessionActive ? {} : keyParams()
-      });
+      const data = await fetchJSON('/images/prune', { method: 'POST' });
       const reclaimed = (data.SpaceReclaimed != null ? data.SpaceReclaimed : 0);
       alert(t('cleaned_ok', { bytes: reclaimed }));
       await fetchUnusedImages();
@@ -315,29 +343,41 @@ document.addEventListener('DOMContentLoaded', () => {
     const params = {};
     if (force) params.force = '1';
     if (light) params.light = '1';
-    const data = await fetchJSON('/status', { params: sessionActive ? params : keyParams(params) });
-    return data;
+    return await fetchJSON('/status', { params });
   }
   async function fetchStatusOne(name, force=false) {
     const params = force ? { force: '1' } : {};
-    const data = await fetchJSON(`/status/${encodeURIComponent(name)}`, { params: sessionActive ? params : keyParams(params) });
-    return data;
+    return await fetchJSON(`/status/${encodeURIComponent(name)}`, { params });
   }
-  async function fetchMetricsOne(name){
-    try{
-      const data = await fetchJSON(`/metrics/${encodeURIComponent(name)}`, { params: sessionActive ? {} : keyParams() });
+
+  // ---------- Batch metrics (single call instead of N) ----------
+  async function fetchAllMetrics() {
+    try {
+      const data = await fetchJSON('/metrics');
+      if (!data || data.status !== 'ok' || !data.metrics) return;
+      for (const [name, m] of Object.entries(data.metrics)) {
+        const tr = document.getElementById(`row-${name}`);
+        if (!tr) continue;
+        renderResourcesCell(tr.children[1], m, name);
+      }
+    } catch (e) { /* soft fail */ }
+  }
+
+  async function fetchMetricsOne(name) {
+    try {
+      const data = await fetchJSON(`/metrics/${encodeURIComponent(name)}`);
       const tr = document.getElementById(`row-${name}`);
       if (!tr) return;
       const m = data.meta || {};
       renderResourcesCell(tr.children[1], m, name);
-    }catch(e){ /* soft */ }
+    } catch (e) { /* soft */ }
   }
+
   async function updateContainer(name, btn) {
     if (btn) { btn.disabled = true; btn.textContent = t('update_btn'); }
     try {
       const data = await fetchJSON('/update_container', {
-        method:'POST',
-        params: sessionActive ? {} : keyParams(),
+        method: 'POST',
         body: { name }
       });
       if (data && (data.updated === false || /already up to date/i.test(String(data.message||'')))) {
@@ -371,7 +411,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const label = document.createElement('div'); label.className = 'meter__label'; label.textContent = labelTxt; box.appendChild(label);
       const meter = document.createElement('div'); meter.className = 'meter';
       const bar = document.createElement('div'); bar.className = 'meter__bar'; bar.style.width = '35%'; meter.appendChild(bar); box.appendChild(meter);
-      const val = document.createElement('div'); val.className = 'meter__val'; val.textContent = '—'; box.appendChild(val);
+      const val = document.createElement('div'); val.className = 'meter__val'; val.textContent = '\u2014'; box.appendChild(val);
       return box;
     };
     metrics.appendChild(skeleton(t('CPU')));
@@ -385,7 +425,7 @@ document.addEventListener('DOMContentLoaded', () => {
     td.className = 'rescell';
     const state = document.createElement('div');
     state.className = 'rescell__state ' + stateClass(m?.state);
-    state.textContent = m?.state || '—';
+    state.textContent = m?.state || '\u2014';
     td.appendChild(state);
     const metrics = document.createElement('div'); metrics.className = 'rescell__metrics';
 
@@ -415,26 +455,12 @@ document.addEventListener('DOMContentLoaded', () => {
       const sum = rxps + txps;
       const scale = Math.max(netPeakBps, 1);
       const pct = clampPct((sum / scale) * 100);
-      const suffix = `↑ ${formatRate(txps)} • ↓ ${formatRate(rxps)}`;
+      const suffix = `\u2191 ${formatRate(txps)} \u2022 \u2193 ${formatRate(rxps)}`;
       metrics.appendChild(makeBarMetric(t('NET'), pct, suffix));
     }
 
     td.appendChild(metrics);
     td.setAttribute('data-has-metrics', '1');
-  }
-
-  const visibleNames = new Set();
-  const listRoot = document.querySelector('.panel');
-  const rowObserver = new IntersectionObserver((entries)=>{
-    for (const e of entries) {
-      const tr = e.target;
-      const name = tr?.id?.startsWith('row-') ? tr.id.slice(4) : null;
-      if (!name) continue;
-      if (e.isIntersecting) visibleNames.add(name); else visibleNames.delete(name);
-    }
-  }, { root: listRoot || null, threshold: 0.1 });
-  function observeRow(tr) {
-    try { rowObserver.observe(tr); } catch {}
   }
 
   function applyData(data, { pending = false } = {}) {
@@ -451,7 +477,6 @@ document.addEventListener('DOMContentLoaded', () => {
         netPrev.delete(name);
         cpuEma.delete(name);
         ramEma.delete(name);
-        visibleNames.delete(name);
       }
     }
 
@@ -462,7 +487,9 @@ document.addEventListener('DOMContentLoaded', () => {
         tr.id = `row-${name}`;
 
         const tdName = document.createElement('td');
-        tdName.innerHTML = `<strong>${name}</strong>`;
+        const strong = document.createElement('strong');
+        strong.textContent = name;
+        tdName.appendChild(strong);
 
         const tdRes = document.createElement('td'); tdRes.className = 'rescell';
 
@@ -477,7 +504,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btnUpdate.onclick = () => updateContainer(name, btnUpdate);
 
         const btnRefresh = document.createElement('button');
-        btnRefresh.textContent = '↻ ' + t('refresh');
+        btnRefresh.textContent = '\u21bb ' + t('refresh');
         btnRefresh.className = 'btn';
         btnRefresh.style.marginLeft = '8px';
         btnRefresh.onclick = async (ev) => {
@@ -493,9 +520,7 @@ document.addEventListener('DOMContentLoaded', () => {
             tdStatus.innerHTML = '';
             tdStatus.appendChild(tag(st2));
             renderResourcesCell(tdRes, m2, name);
-            const link = repoLinkFromImage(m2.image);
-            const label = repoLabelFromImage(m2.image);
-            tdLink.innerHTML = link ? `<a href="${link}" target="_blank" rel="noopener noreferrer">${label}</a>` : (label || '—');
+            setLinkCell(tdLink, m2.image);
           } catch (e) {
             alert(e.message);
           } finally {
@@ -512,7 +537,6 @@ document.addEventListener('DOMContentLoaded', () => {
         tr.appendChild(tdLink);
         tr.appendChild(tdAct);
         tbody.appendChild(tr);
-        observeRow(tr);
       }
 
       const m = (data.meta && data.meta[name]) || {};
@@ -529,28 +553,17 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
 
-      const link = repoLinkFromImage(m.image);
-      const label = repoLabelFromImage(m.image);
-      const linkCell = tr.children[3];
-      linkCell.innerHTML = link ? `<a href="${link}" target="_blank" rel="noopener noreferrer">${label}</a>` : (label || '—');
+      setLinkCell(tr.children[3], m.image);
 
       const btnUpdate = tr.children[4].querySelector('button');
       if (btnUpdate) btnUpdate.disabled = (!pending) && (st === 'not_found' || (typeof st === 'string' && st.startsWith('error')));
     }
   }
 
-  async function fillVisibleMetricsLazily(){
-    const batch = Array.from(visibleNames);
-    const chunkSize = 6;
-    for (let i=0; i<batch.length; i+=chunkSize){
-      await Promise.all(batch.slice(i, i+chunkSize).map(n => fetchMetricsOne(n)));
-    }
-  }
-
-  async function render(force=false, showLoading=false){
+  async function render(force=false, showLoading=false) {
     if (isRendering) return;
     isRendering = true;
-    try{
+    try {
       if (showLoading && tbody) {
         for (const tr of Array.from(tbody.querySelectorAll('tr'))) {
           const tdRes = tr.children[1];
@@ -559,28 +572,75 @@ document.addEventListener('DOMContentLoaded', () => {
           if (tdRes) renderResourcesLoading(tdRes);
         }
       }
-      const data = await fetchStatus({ force, light:true });
+      const data = await fetchStatus({ force, light: true });
       if (data && data.status === 'ok') {
-        try { localStorage.setItem('dm_cache', JSON.stringify({t:Date.now(), data})); } catch {}
-        applyData(data, {pending:false});
-        fillVisibleMetricsLazily();
+        try { localStorage.setItem('dm_cache', JSON.stringify({ t: Date.now(), data })); } catch {}
+        applyData(data, { pending: false });
+        fetchAllMetrics();
       }
-    }catch(e){
+    } catch (e) {
       console.error(e);
-      try{
+      try {
         const raw = localStorage.getItem('dm_cache');
-        if (raw){
+        if (raw) {
           const cache = JSON.parse(raw);
           if (cache && cache.data && cache.data.status === 'ok') {
-            applyData(cache.data, {pending:true});
+            applyData(cache.data, { pending: true });
           }
         }
-      }catch{}
-    }finally{
+      } catch {}
+    } finally {
       isRendering = false;
     }
   }
 
+  // ---------- SSE — Server-Sent Events ----------
+  let evtSource = null;
+  let sseRetryTimeout = null;
+
+  function buildSseUrl() {
+    const params = sseKeyParams();
+    const qs = new URLSearchParams(params).toString();
+    return '/events' + (qs ? '?' + qs : '');
+  }
+
+  function connectSSE() {
+    if (evtSource) {
+      try { evtSource.close(); } catch {}
+    }
+    try {
+      evtSource = new EventSource(buildSseUrl());
+    } catch {
+      sseConnected = false;
+      return;
+    }
+
+    evtSource.addEventListener('connected', () => {
+      sseConnected = true;
+    });
+
+    evtSource.addEventListener('status', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data && data.status === 'ok') {
+          applyData(data, { pending: false });
+          try { localStorage.setItem('dm_cache', JSON.stringify({ t: Date.now(), data })); } catch {}
+        }
+      } catch (err) {
+        console.error('[SSE] parse error', err);
+      }
+    });
+
+    evtSource.onerror = () => {
+      sseConnected = false;
+      try { evtSource.close(); } catch {}
+      evtSource = null;
+      if (sseRetryTimeout) clearTimeout(sseRetryTimeout);
+      sseRetryTimeout = setTimeout(connectSSE, 5000);
+    };
+  }
+
+  // ---------- Settings UI ----------
   function openSettings() {
     fetchSettings()
       .then(s => {
@@ -590,14 +650,14 @@ document.addEventListener('DOMContentLoaded', () => {
           apiKeyInput.placeholder = '********';
         }
         if (ipAllowInput) ipAllowInput.value = (Array.isArray(s.allowed_cidrs) ? s.allowed_cidrs : ['0.0.0.0/0']).join('\n');
-        if (settingsModal){ settingsModal.style.display = 'block'; settingsModal.setAttribute('aria-hidden', 'false'); }
+        if (settingsModal) { settingsModal.style.display = 'block'; settingsModal.setAttribute('aria-hidden', 'false'); }
       })
       .catch(() => {
-        if (settingsModal){ settingsModal.style.display = 'block'; settingsModal.setAttribute('aria-hidden', 'false'); }
+        if (settingsModal) { settingsModal.style.display = 'block'; settingsModal.setAttribute('aria-hidden', 'false'); }
       });
   }
   function closeSettings() {
-    if (settingsModal){ settingsModal.style.display = 'none'; settingsModal.setAttribute('aria-hidden', 'true'); }
+    if (settingsModal) { settingsModal.style.display = 'none'; settingsModal.setAttribute('aria-hidden', 'true'); }
   }
   async function onSaveSettings() {
     try {
@@ -608,21 +668,20 @@ document.addEventListener('DOMContentLoaded', () => {
       };
       const maybeKey = apiKeyInput ? apiKeyInput.value.trim() : '';
       if (maybeKey && !isMaskedKey(maybeKey)) {
-        payload.api_key = maybeKey; 
+        payload.api_key = maybeKey;
       }
       await saveSettings(payload);
       alert(t('settings_saved'));
       closeSettings();
 
-      
       if (authState.auth_enabled) {
-        
         await tryStartSessionWithApiKey();
       }
 
+      connectSSE();
       render(true);
     } catch (e) {
-      alert((LANG === 'en' ? 'Error while saving: ' : 'Erreur lors de l’enregistrement: ') + e.message);
+      alert((LANG === 'en' ? 'Error while saving: ' : 'Erreur lors de l\u2019enregistrement: ') + e.message);
     }
   }
   async function onGenerateApiKey() {
@@ -634,7 +693,7 @@ document.addEventListener('DOMContentLoaded', () => {
         allowed_cidrs: allowed
       });
       if (apiKeyInput) {
-        apiKeyInput.value = data.api_key || ''; 
+        apiKeyInput.value = data.api_key || '';
       }
       if (useApiKeyCheckbox) useApiKeyCheckbox.checked = !!data.auth_enabled;
 
@@ -653,7 +712,7 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.innerHTML = `<span class="spinner"></span> ${t('refresh_ing')}`;
     try {
       await render(true, true);
-      setTimeout(() => fillVisibleMetricsLazily(), 200);
+      setTimeout(() => fetchAllMetrics(), 200);
     } catch (err) {
       console.error(err);
       alert(t('refresh_fail', { err: (err?.message || err) }));
@@ -706,9 +765,16 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch {}
 
     await render(true, true);
-    setTimeout(() => fillVisibleMetricsLazily(), 300);
 
-    setInterval(() => render(false), FAST_REFRESH_MS);
+    connectSSE();
+
+    setInterval(() => fetchAllMetrics(), METRICS_REFRESH_MS);
+
+    // Fallback polling only when SSE is disconnected
+    setInterval(() => {
+      if (!sseConnected) render(false);
+    }, FALLBACK_REFRESH_MS);
+
     setInterval(() => render(false), 3600000);
   })();
 });

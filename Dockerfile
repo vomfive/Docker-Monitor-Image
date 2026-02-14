@@ -14,4 +14,7 @@ COPY static/ ./static/
 
 EXPOSE 5000
 
-CMD ["python", "script.py"]
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/ping')" || exit 1
+
+CMD ["gunicorn", "-w", "1", "--threads", "16", "-b", "0.0.0.0:5000", "--timeout", "120", "script:app"]

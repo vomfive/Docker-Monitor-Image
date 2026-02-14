@@ -1,12 +1,15 @@
-import os, time, urllib.request, logging, json, secrets, ipaddress, threading
+import os, time, urllib.request, logging, json, secrets, ipaddress, threading, queue, hmac
 from typing import Optional
-from flask import Flask, jsonify, request, abort, render_template, send_from_directory
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Flask, jsonify, request, abort, render_template, send_from_directory, Response, session
+from flask_compress import Compress
 import docker
 from urllib import parse as _urlparse
 from urllib.error import HTTPError
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
+Compress(app)
 
 SETTINGS_PATH = os.getenv("SETTINGS_PATH", "/data/settings.json")
 
@@ -63,11 +66,67 @@ if isinstance(_disk, dict):
     if parsed:
       ALLOWED_CIDRS = parsed
 
+# ---------------------------------------------------------------------------
+# Flask secret key for sessions — persisted so gunicorn workers share it
+# ---------------------------------------------------------------------------
+_env_secret = os.getenv("SECRET_KEY")
+if _env_secret:
+  app.secret_key = _env_secret
+elif isinstance(_disk, dict) and _disk.get("secret_key"):
+  app.secret_key = _disk["secret_key"]
+else:
+  app.secret_key = secrets.token_hex(32)
+  _save_settings_to_disk({
+    "auth_enabled": AUTH_ENABLED,
+    "api_key": CURRENT_API_KEY,
+    "allowed_cidrs": ALLOWED_CIDRS,
+    "secret_key": app.secret_key,
+  })
+
 def _check_auth():
   if not AUTH_ENABLED:
     return True
+  # 1. Flask session cookie
+  if session.get('authenticated'):
+    return True
+  # 2. Authorization: Bearer <key> header
+  auth_header = request.headers.get('Authorization', '')
+  if auth_header.startswith('Bearer '):
+    token = auth_header[7:].strip()
+    if CURRENT_API_KEY and hmac.compare_digest(token, CURRENT_API_KEY):
+      return True
+  # 3. Query param fallback (needed for SSE EventSource)
   provided = request.args.get('key') or ''
-  return bool(CURRENT_API_KEY) and (provided == CURRENT_API_KEY)
+  if CURRENT_API_KEY and provided and hmac.compare_digest(provided, CURRENT_API_KEY):
+    return True
+  app.logger.warning("auth failed from %s", request.remote_addr)
+  return False
+
+# ---------------------------------------------------------------------------
+# Rate limiting — brute-force protection on /auth/login
+# ---------------------------------------------------------------------------
+_auth_failures = {}
+_AUTH_MAX_FAILURES = 5
+_AUTH_LOCKOUT_SECONDS = 300
+
+def _is_rate_limited(ip: str) -> bool:
+  entry = _auth_failures.get(ip)
+  if not entry:
+    return False
+  if entry["count"] >= _AUTH_MAX_FAILURES:
+    if time.time() - entry["last"] < _AUTH_LOCKOUT_SECONDS:
+      return True
+    del _auth_failures[ip]
+  return False
+
+def _record_auth_failure(ip: str):
+  entry = _auth_failures.get(ip, {"count": 0, "last": 0})
+  entry["count"] = entry["count"] + 1
+  entry["last"] = time.time()
+  _auth_failures[ip] = entry
+
+def _reset_auth_failures(ip: str):
+  _auth_failures.pop(ip, None)
 
 def _is_ip_allowed(addr: str) -> bool:
   try:
@@ -83,7 +142,19 @@ def _is_ip_allowed(addr: str) -> bool:
       continue
   return False
 
-client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto', timeout=10)
+# ---------------------------------------------------------------------------
+# Docker client — clear error if socket is not mounted
+# ---------------------------------------------------------------------------
+try:
+  client = docker.DockerClient(base_url='unix://var/run/docker.sock', version='auto', timeout=10)
+  client.ping()
+except Exception as e:
+  logging.critical(
+    "Cannot connect to Docker at /var/run/docker.sock: %s\n"
+    "Make sure to mount the socket: -v /var/run/docker.sock:/var/run/docker.sock",
+    e,
+  )
+  raise SystemExit(1)
 
 try:
   SELF_CONTAINER_ID = os.getenv("HOSTNAME")
@@ -106,6 +177,8 @@ except Exception:
 
 _ARCH_MAP = {'x86_64': 'amd64','aarch64': 'arm64','arm64/v8': 'arm64','arm64v8': 'arm64','armv7l': 'arm','armv7': 'arm','armv6l': 'arm'}
 _LOCAL_ARCH = _ARCH_MAP.get(_LOCAL_ARCH, _LOCAL_ARCH)
+
+_pool = ThreadPoolExecutor(max_workers=12)
 
 def _compute_unused_images():
   try:
@@ -138,13 +211,17 @@ def images_prune():
   except Exception as e:
     return jsonify({'error': str(e)}), 500
 
+# ---------------------------------------------------------------------------
+# Registry digest resolution — optimized: fewer HTTP round-trips
+# ---------------------------------------------------------------------------
+ACCEPTS_PRIORITY = [
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json",
+  "application/vnd.oci.image.manifest.v1+json",
+]
+
 def get_remote_digest(image: str) -> Optional[str]:
-  ACCEPTS = [
-    "application/vnd.oci.image.index.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json",
-    "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.docker.distribution.manifest.v2+json",
-  ]
   def _split_repo_tag(ref: str):
     if ":" in ref and "/" in ref.split(":")[0]: repo, tag = ref.rsplit(":", 1)
     elif ":" in ref and "/" not in ref: repo, tag = ref.split(":", 1)
@@ -165,8 +242,9 @@ def get_remote_digest(image: str) -> Optional[str]:
         k, v = part.split("=", 1)
         d[k.strip()] = v.strip().strip('"')
     return d
+
   def _head_or_get(url: str, token: Optional[str]):
-    for acc in ACCEPTS:
+    for acc in ACCEPTS_PRIORITY:
       headers = {"Accept": acc}
       if token: headers["Authorization"] = f"Bearer {token}"
       try:
@@ -175,19 +253,23 @@ def get_remote_digest(image: str) -> Optional[str]:
           d = resp.headers.get("Docker-Content-Digest")
           if d: return d, None
       except HTTPError as he:
-        if he.code in (401, 404): return None, he.code
+        if he.code == 404: return None, 404
+        if he.code == 401: return None, 401
       except Exception:
         pass
-      try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-          d = resp.headers.get("Docker-Content-Digest")
-          if d: return d, None
-      except HTTPError as he:
-        if he.code in (401, 404): return None, he.code
-      except Exception:
-        pass
+    headers = {"Accept": ACCEPTS_PRIORITY[0]}
+    if token: headers["Authorization"] = f"Bearer {token}"
+    try:
+      req = urllib.request.Request(url, headers=headers)
+      with urllib.request.urlopen(req, timeout=12) as resp:
+        d = resp.headers.get("Docker-Content-Digest")
+        if d: return d, None
+    except HTTPError as he:
+      return None, he.code
+    except Exception:
+      pass
     return None, None
+
   def _fetch_with_optional_auth(url: str, registry_hint: str):
     try:
       d, code = _head_or_get(url, None)
@@ -197,7 +279,7 @@ def get_remote_digest(image: str) -> Optional[str]:
     except Exception:
       return None, None
     try:
-      req = urllib.request.Request(url, headers={"Accept": ACCEPTS[0]})
+      req = urllib.request.Request(url, headers={"Accept": ACCEPTS_PRIORITY[0]})
       with urllib.request.urlopen(req, timeout=12) as resp:
         return resp.headers.get("Docker-Content-Digest"), None
     except HTTPError as e:
@@ -243,11 +325,51 @@ def fetch_remote_digest_cached(image_ref: str, *, force: bool = False, now_ts: O
   _pull_cache[image_ref] = {"digest": digest, "ts": now_ts}
   return digest
 
+# ---------------------------------------------------------------------------
+# Request hooks
+# ---------------------------------------------------------------------------
 @app.before_request
 def limit_remote_addr():
+  # /ping is exempt (used by Docker HEALTHCHECK from localhost)
+  if request.path == '/ping':
+    return
   if not _is_ip_allowed(request.remote_addr or ""):
     abort(403)
 
+# ---------------------------------------------------------------------------
+# Healthcheck endpoint — no auth, no IP check
+# ---------------------------------------------------------------------------
+@app.get('/ping')
+def ping():
+  return jsonify({"status": "ok"})
+
+# ---------------------------------------------------------------------------
+# Session-based authentication
+# ---------------------------------------------------------------------------
+@app.post('/auth/login')
+def auth_login():
+  ip = request.remote_addr or ""
+  if _is_rate_limited(ip):
+    app.logger.warning("auth/login rate-limited for %s", ip)
+    return jsonify({"status": "error", "error": "too_many_attempts"}), 429
+  data = request.get_json(silent=True) or {}
+  key = data.get("api_key", "")
+  if not AUTH_ENABLED:
+    _reset_auth_failures(ip)
+    session['authenticated'] = True
+    return jsonify({"status": "ok"})
+  if CURRENT_API_KEY and key and hmac.compare_digest(key, CURRENT_API_KEY):
+    _reset_auth_failures(ip)
+    session['authenticated'] = True
+    app.logger.info("auth/login success from %s", ip)
+    return jsonify({"status": "ok"})
+  _record_auth_failure(ip)
+  app.logger.warning("auth/login failed from %s (attempt %d)", ip, _auth_failures.get(ip, {}).get("count", 0))
+  return jsonify({"status": "error", "error": "invalid_key"}), 401
+
+# ---------------------------------------------------------------------------
+# Settings — GET always 200 (frontend needs auth_enabled), POST requires auth
+# ---------------------------------------------------------------------------
 @app.get('/settings')
 def get_settings():
   return jsonify({
@@ -259,6 +381,8 @@ def get_settings():
 @app.post('/settings')
 def post_settings():
   global AUTH_ENABLED, CURRENT_API_KEY, ALLOWED_CIDRS
+  if AUTH_ENABLED and not _check_auth():
+    return jsonify({'error': 'unauthorized'}), 401
   data = request.get_json(silent=True) or {}
   AUTH_ENABLED = bool(data.get('auth_enabled'))
   gen_flag = bool(data.get('generate_api_key'))
@@ -276,7 +400,12 @@ def post_settings():
     parsed = None
   if parsed is not None:
     ALLOWED_CIDRS = parsed or ["0.0.0.0/0"]
-  _save_settings_to_disk({"auth_enabled": AUTH_ENABLED, "api_key": CURRENT_API_KEY, "allowed_cidrs": ALLOWED_CIDRS})
+  _save_settings_to_disk({
+    "auth_enabled": AUTH_ENABLED,
+    "api_key": CURRENT_API_KEY,
+    "allowed_cidrs": ALLOWED_CIDRS,
+    "secret_key": app.secret_key,
+  })
   return jsonify({'ok': True, 'auth_enabled': AUTH_ENABLED, 'api_key': CURRENT_API_KEY, 'allowed_cidrs': ALLOWED_CIDRS})
 
 @app.get("/health")
@@ -388,8 +517,8 @@ def _compute_light_meta(container):
     pass
   return m
 
-_stats_cache = {} 
-_STATS_TTL = 2.0
+_stats_cache = {}
+_STATS_TTL = 8.0
 
 def _compute_stats_cached(container):
   now = time.time()
@@ -401,66 +530,76 @@ def _compute_stats_cached(container):
   _stats_cache[key] = {"ts": now, "meta": meta}
   return meta
 
+def _resolve_image_ref(container):
+  img_attrs = container.image.attrs or {}
+  repo_tags = img_attrs.get("RepoTags") or container.image.tags or []
+  image_ref = repo_tags[0] if repo_tags else None
+  if not image_ref:
+    repo_digests = img_attrs.get("RepoDigests") or []
+    if repo_digests:
+      repo = repo_digests[0].split("@")[0]
+      image_ref = f"{repo}:latest"
+  return image_ref, img_attrs
+
+# ---------------------------------------------------------------------------
+# Parallelized update checks
+# ---------------------------------------------------------------------------
 def check_updates_for_containers(containers, *, force: bool = False):
   updates, meta = {}, {}
   now_ts = time.time()
-  for container in containers:
+
+  def _process_one(container):
     name = container.name
     try:
-      img_attrs = container.image.attrs or {}
-      repo_tags = img_attrs.get("RepoTags") or container.image.tags or []
-      image_ref = repo_tags[0] if repo_tags else None
+      image_ref, img_attrs = _resolve_image_ref(container)
       if not image_ref:
-        repo_digests = img_attrs.get("RepoDigests") or []
-        if repo_digests:
-          repo = repo_digests[0].split("@")[0]
-          image_ref = f"{repo}:latest"
-      if not image_ref:
-        updates[name] = "unknown_image"; meta[name] = _compute_stats(container); continue
+        return name, "unknown_image", _compute_stats_cached(container)
       local_digests = _local_repo_digests(img_attrs)
       if not local_digests:
-        updates[name] = "unknown_local_digest"; meta[name] = _compute_stats(container); continue
+        return name, "unknown_local_digest", _compute_stats_cached(container)
       remote_digest = fetch_remote_digest_cached(image_ref, force=force, now_ts=now_ts)
       if not remote_digest:
-        updates[name] = "registry_error"; meta[name] = _compute_stats(container); continue
+        return name, "registry_error", _compute_stats_cached(container)
       rdig = _digest_only(remote_digest)
       same = any(_digest_only(ld) == rdig for ld in local_digests)
-      updates[name] = "up_to_date" if same else "update_available"
-      meta[name] = _compute_stats(container)
+      return name, ("up_to_date" if same else "update_available"), _compute_stats_cached(container)
     except Exception as e:
-      updates[name] = f"error: {e}"
-      meta[name] = {}
+      return name, f"error: {e}", {}
+
+  futures = [_pool.submit(_process_one, c) for c in containers]
+  for f in as_completed(futures):
+    name, st, m = f.result()
+    updates[name] = st
+    meta[name] = m
   return updates, meta
 
 def check_updates_for_containers_light(containers, *, force: bool = False):
   updates, meta = {}, {}
   now_ts = time.time()
-  for container in containers:
+
+  def _process_one(container):
     name = container.name
     try:
-      img_attrs = container.image.attrs or {}
-      repo_tags = img_attrs.get("RepoTags") or container.image.tags or []
-      image_ref = repo_tags[0] if repo_tags else None
+      image_ref, img_attrs = _resolve_image_ref(container)
       if not image_ref:
-        repo_digests = img_attrs.get("RepoDigests") or []
-        if repo_digests:
-          repo = repo_digests[0].split("@")[0]
-          image_ref = f"{repo}:latest"
-      if not image_ref:
-        updates[name] = "unknown_image"; meta[name] = _compute_light_meta(container); continue
+        return name, "unknown_image", _compute_light_meta(container)
       local_digests = _local_repo_digests(img_attrs)
       if not local_digests:
-        updates[name] = "unknown_local_digest"; meta[name] = _compute_light_meta(container); continue
+        return name, "unknown_local_digest", _compute_light_meta(container)
       remote_digest = fetch_remote_digest_cached(image_ref, force=force, now_ts=now_ts)
       if not remote_digest:
-        updates[name] = "registry_error"; meta[name] = _compute_light_meta(container); continue
+        return name, "registry_error", _compute_light_meta(container)
       rdig = _digest_only(remote_digest)
       same = any(_digest_only(ld) == rdig for ld in local_digests)
-      updates[name] = "up_to_date" if same else "update_available"
-      meta[name] = _compute_light_meta(container)
+      return name, ("up_to_date" if same else "update_available"), _compute_light_meta(container)
     except Exception as e:
-      updates[name] = f"error: {e}"
-      meta[name] = _compute_light_meta(container)
+      return name, f"error: {e}", _compute_light_meta(container)
+
+  futures = [_pool.submit(_process_one, c) for c in containers]
+  for f in as_completed(futures):
+    name, st, m = f.result()
+    updates[name] = st
+    meta[name] = m
   return updates, meta
 
 @app.route("/status")
@@ -476,6 +615,26 @@ def docker_status():
     updates, meta = check_updates_for_containers(containers, force=force)
   app.logger.info("/status(light=%s) -> %d containers", light, len(updates))
   return jsonify({"status": "ok","updates": {str(k): v for k, v in updates.items()},"meta": {str(k): v for k, v in meta.items()}})
+
+# ---------------------------------------------------------------------------
+# Batch metrics endpoint
+# ---------------------------------------------------------------------------
+@app.get("/metrics")
+def metrics_all():
+  if not _check_auth():
+    return jsonify({"error": "unauthorized"}), 401
+  try:
+    containers = client.containers.list(all=True)
+  except Exception as e:
+    return jsonify({"error": str(e)}), 500
+  result = {}
+  def _get_stats(c):
+    return c.name, _compute_stats_cached(c)
+  futures = [_pool.submit(_get_stats, c) for c in containers]
+  for f in as_completed(futures):
+    name, m = f.result()
+    result[name] = m
+  return jsonify({"status": "ok", "metrics": result})
 
 @app.get("/metrics/<name>")
 def metrics_one(name):
@@ -542,7 +701,7 @@ def update_container():
   if not name:
     return jsonify({"error": "Missing 'name'"}), 400
   if SELF_CONTAINER_NAME and name == SELF_CONTAINER_NAME:
-    return jsonify({"error": "self_update_blocked","message": "Ce service ne peut pas se mettre à jour lui-même via l’API. Mettez à jour le conteneur 'docker-monitor' depuis Portainer/Docker."}), 409
+    return jsonify({"error": "self_update_blocked","message": "Ce service ne peut pas se mettre \u00e0 jour lui-m\u00eame via l'API. Mettez \u00e0 jour le conteneur 'docker-monitor' depuis Portainer/Docker."}), 409
   try:
     container = client.containers.get(name)
   except docker.errors.NotFound:
@@ -641,18 +800,125 @@ def update_container():
   except Exception as e:
     return jsonify({"error": str(e)}), 500
 
+# ---------------------------------------------------------------------------
+# SSE — Server-Sent Events
+# ---------------------------------------------------------------------------
+_sse_clients = []
+_sse_lock = threading.Lock()
+
+def _broadcast_sse(event_type: str, data: dict):
+  msg = f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
+  with _sse_lock:
+    dead = []
+    for q in _sse_clients:
+      try:
+        q.put_nowait(msg)
+      except Exception:
+        dead.append(q)
+    for q in dead:
+      try: _sse_clients.remove(q)
+      except Exception: pass
+
+@app.get("/events")
+def sse_stream():
+  if not _check_auth():
+    return jsonify({"error": "unauthorized"}), 401
+  q = queue.Queue(maxsize=50)
+  with _sse_lock:
+    _sse_clients.append(q)
+  def generate():
+    try:
+      yield "event: connected\ndata: {}\n\n"
+      while True:
+        try:
+          msg = q.get(timeout=25)
+          yield msg
+        except queue.Empty:
+          yield ": keepalive\n\n"
+    except GeneratorExit:
+      pass
+    finally:
+      with _sse_lock:
+        try: _sse_clients.remove(q)
+        except Exception: pass
+  return Response(generate(), mimetype='text/event-stream',
+                  headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+def _sse_background_loop():
+  last_hash = None
+  while True:
+    try:
+      with _sse_lock:
+        has_clients = len(_sse_clients) > 0
+      if has_clients:
+        containers = client.containers.list(all=True)
+        updates, meta = check_updates_for_containers_light(containers, force=False)
+        payload = {"status": "ok",
+                    "updates": {str(k): v for k, v in updates.items()},
+                    "meta": {str(k): v for k, v in meta.items()}}
+        current_hash = json.dumps(payload, sort_keys=True, default=str)
+        if current_hash != last_hash:
+          _broadcast_sse("status", payload)
+          last_hash = current_hash
+    except Exception as e:
+      logging.info("SSE loop error: %s", e)
+    time.sleep(10)
+
+threading.Thread(target=_sse_background_loop, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Warm remote digest cache — parallelized
+# ---------------------------------------------------------------------------
 def warm_remote_digest_cache():
   while True:
     try:
-      for c in client.containers.list(all=True):
+      containers = client.containers.list(all=True)
+      refs = []
+      for c in containers:
         tags = (c.image.attrs.get("RepoTags") or c.image.tags or [])
-        if not tags: continue
-        fetch_remote_digest_cached(tags[0], force=False)
+        if tags:
+          refs.append(tags[0])
+      futures = [_pool.submit(fetch_remote_digest_cached, ref, force=False) for ref in refs]
+      for f in as_completed(futures):
+        try: f.result()
+        except Exception: pass
     except Exception as e:
       logging.info("warm cache error: %s", e)
     time.sleep(900)
 
 threading.Thread(target=warm_remote_digest_cache, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Periodic cache cleanup — prevents memory leaks from removed containers
+# ---------------------------------------------------------------------------
+def _cleanup_caches():
+  while True:
+    try:
+      containers = client.containers.list(all=True)
+      current_names = {c.name for c in containers}
+      current_refs = set()
+      for c in containers:
+        tags = (c.image.attrs.get("RepoTags") or c.image.tags or [])
+        if tags:
+          current_refs.add(tags[0])
+      # Clean stats cache
+      stale = [k for k in _stats_cache if k not in current_names]
+      for k in stale:
+        del _stats_cache[k]
+      # Clean pull/digest cache
+      stale = [k for k in _pull_cache if k not in current_refs]
+      for k in stale:
+        del _pull_cache[k]
+      # Clean expired rate-limit entries
+      now = time.time()
+      stale = [ip for ip, e in _auth_failures.items() if now - e["last"] > _AUTH_LOCKOUT_SECONDS * 2]
+      for ip in stale:
+        del _auth_failures[ip]
+    except Exception as e:
+      logging.info("cache cleanup error: %s", e)
+    time.sleep(600)
+
+threading.Thread(target=_cleanup_caches, daemon=True).start()
 
 if GUI_ENABLED:
   @app.get("/")
@@ -667,7 +933,7 @@ else:
     return jsonify({
       "status": "ok",
       "message": "GUI disabled. API endpoints are available.",
-      "endpoints": ["/diag", "/status", "/metrics/<name>", "/update_container", "/images/unused", "/images/prune", "/settings"]
+      "endpoints": ["/ping", "/diag", "/status", "/metrics", "/metrics/<name>", "/update_container", "/images/unused", "/images/prune", "/settings", "/events"]
     })
 
 if __name__ == "__main__":
